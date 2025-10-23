@@ -63,6 +63,7 @@ public class CostExplorerService {
     /**
      * Get aggregated usage per customer for billing
      * Uses denormalized customer_id in usage_snapshot for fast queries
+     * @return usage by customer id
      */
     public Map<String, Double> getCustomerUsageForBilling(Instant from, Instant to) {
         Map<String, Double> customerUsage = new HashMap<>();

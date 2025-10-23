@@ -2,6 +2,7 @@ package com.bitmovin.platform.challenge.scheduled;
 
 import com.bitmovin.platform.challenge.entity.BillingEvent;
 import com.bitmovin.platform.challenge.entity.Distribution;
+import com.bitmovin.platform.challenge.entity.UsageSnapshot;
 import com.bitmovin.platform.challenge.entity.enums.BillingEventStatus;
 import com.bitmovin.platform.challenge.repository.BillingEventRepository;
 import com.bitmovin.platform.challenge.repository.DistributionRepository;
@@ -46,6 +47,16 @@ public class BillingScheduledJob {
     )
     public void sendBillingEvents() {
         log.info("Starting billing job execution");
+
+        Instant periodEnd = Instant.now().truncatedTo(ChronoUnit.DAYS); // Today at 00:00 UTC (midnight)
+        Instant periodStart = periodEnd.minus(Duration.ofDays(1)); // Yesterday at 00:00 UTC (previous midnight)
+        Map<String, Double> customerUsageForBilling = costExplorerService.getCustomerUsageForBilling(periodStart, periodEnd);
+
+        new UsageSnapshot(
+                null,
+
+        )
+
         Instant jobStart = Instant.now();
         int processedCount = 0;
         int errorCount = 0;

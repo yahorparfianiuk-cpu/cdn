@@ -1,0 +1,12 @@
+services:
+  redis:
+    image: redis:8.2.2
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: redis-cli ping
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5

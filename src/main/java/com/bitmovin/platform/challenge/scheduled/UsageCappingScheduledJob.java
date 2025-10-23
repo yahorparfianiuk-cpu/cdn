@@ -37,7 +37,7 @@ public class UsageCappingScheduledJob {
      * Runs every minute to check usage limits
      * Only one instance will execute due to ShedLock
      */
-    @Scheduled(fixedRate = 60000) // Every 1 minute
+    @Scheduled(fixedRate = 15 * 60 * 1000) // Every 15 minutes
     @SchedulerLock(
             name = "usageCappingJob",
             lockAtMostFor = "PT5M",
