@@ -1,0 +1,1982 @@
+# CDN BILLING & USAGE MONITORING SYSTEM - IMPLEMENTATION PLAN
+
+**Project**: Bitmovin CDN Challenge - Live Coding Interview
+**Complexity Level**: Level 4 (Advanced - Multi-subsystem, Distributed Systems)
+**Estimated Time**: 4 hours
+**Status**: PLANNING COMPLETE → Ready for IMPLEMENTATION
+
+---
+
+## 📋 TABLE OF CONTENTS
+
+1. [Requirements Analysis](#requirements-analysis)
+2. [Architecture Overview](#architecture-overview)
+3. [Implementation Phases](#implementation-phases)
+4. [High Availability Strategy](#high-availability-strategy)
+5. [Challenges & Mitigations](#challenges--mitigations)
+6. [Testing Strategy](#testing-strategy)
+7. [Observability Plan](#observability-plan)
+8. [Implementation Checklist](#implementation-checklist)
+
+---
+
+## 🎯 REQUIREMENTS ANALYSIS
+
+### Functional Requirements
+
+#### 1. Billing Integration
+- Send CDN usage events to billing system **every 24 hours**
+- Use accurate AWS Cost Explorer data (24h delayed)
+- Event format:
+  ```json
+  {
+    "type": "EVENT_CDN_USAGE",
+    "payload": {
+      "id": "<identifier>",
+      "customerId": "...",
+      "startPeriod": "<start timestamp>",
+      "endPeriod": "<end timestamp>",
+      "trafficUsageGb": "<traffic within period in GB>"
+    }
+  }
+  ```
+- For challenge: `System.out.println()` to console
+- In production: Would publish to message broker (Kafka)
+
+#### 2. Customer REST API
+- Endpoint: `GET /api/usage`
+- Header: `X-Customer-Id` (guaranteed by upstream microservice)
+- Query params: `from` (optional), `to` (optional)
+- Response: Usage data with **24-hour resolution** (one data point per day)
+- Data delay: **Maximum 15 minutes**
+- Use CloudWatch for recent data (< 24h ago)
+- Use Cost Explorer for historical data (> 24h ago)
+
+#### 3. Usage Capping (Auto-Disable CDN)
+- **Limit 1**: 100 GB within 15 minutes → Disable CDN
+- **Limit 2**: 500 GB within 3 hours → Disable CDN
+- Data source: AWS CloudWatch (3-hour window, eventually consistent)
+- Actions when exceeded:
+  1. Set distribution status to DISABLED
+  2. Record disable timestamp and reason
+  3. Publish event to message broker (mock with `System.out.println()`)
+
+#### 4. Data Retrieval Strategy
+| Data Source | Delay | Accuracy | Use Case |
+|-------------|-------|----------|----------|
+| **Cost Explorer** | 24 hours | Exact (byte-level) | Billing, Historical API |
+| **CloudWatch** | 3 hours | Approximate | Capping, Recent API |
+
+### Non-Functional Requirements
+
+#### 1. High Availability (HA)
+- **Critical**: Multiple instances running concurrently
+- **Challenge**: Prevent duplicate billing events
+- **Challenge**: Prevent duplicate capping actions
+- **Solution**: Distributed locking (ShedLock) + idempotency
+
+#### 2. Observability
+- **Logging**: Structured logs for debugging and auditing
+- **Metrics**: Prometheus-compatible metrics via Micrometer
+- **Health**: Actuator health checks for AWS data sources
+- **Monitoring**: Track billing events, capping events, API usage
+
+#### 3. Resilience
+- Handle AWS client failures gracefully
+- Retry mechanisms for transient failures
+- Fallback strategies when data unavailable
+
+---
+
+## 🏗️ ARCHITECTURE OVERVIEW
+
+### System Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                CDN CHALLENGE APPLICATION (Spring Boot)          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌──────────────────────┐          ┌──────────────────────┐    │
+│  │   REST API Layer     │          │   Scheduled Tasks     │    │
+│  │  ┌────────────────┐  │          │  ┌────────────────┐  │    │
+│  │  │ UsageController│  │          │  │  BillingJob    │  │    │
+│  │  └────────────────┘  │          │  │  (24h cadence) │  │    │
+│  │  ┌────────────────┐  │          │  └────────────────┘  │    │
+│  │  │ ExceptionHandler│ │          │  ┌────────────────┐  │    │
+│  │  └────────────────┘  │          │  │  CappingJob    │  │    │
+│  └──────────────────────┘          │  │  (1min cadence)│  │    │
+│           │                         │  └────────────────┘  │    │
+│           │                         │  ┌────────────────┐  │    │
+│           │                         │  │ CollectionJob  │  │    │
+│           │                         │  │  (5min cadence)│  │    │
+│           │                         │  └────────────────┘  │    │
+│           │                         └──────────────────────┘    │
+│           │                                  │                   │
+│           ▼                                  ▼                   │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │         UsageOrchestrationService                       │    │
+│  │  - Coordinates data retrieval                           │    │
+│  │  - Selects appropriate data source                      │    │
+│  │  - Aggregates usage across time periods                 │    │
+│  └────────────────────────────────────────────────────────┘    │
+│           │                                  │                   │
+│  ┌────────▼────────────┐          ┌─────────▼────────────┐    │
+│  │ CloudWatchService   │          │ CostExplorerService  │    │
+│  │ ┌─────────────────┐ │          │ ┌─────────────────┐  │    │
+│  │ │3h window data   │ │          │ │24h delayed data │  │    │
+│  │ │Eventually cons. │ │          │ │Byte-accurate    │  │    │
+│  │ └─────────────────┘ │          │ └─────────────────┘  │    │
+│  │        ▼            │          │         ▼            │    │
+│  │ CloudWatchClient    │          │ CostExplorerClient   │    │
+│  │ (Mock provided)     │          │ (Mock provided)      │    │
+│  └─────────────────────┘          └──────────────────────┘    │
+│           │                                  │                   │
+│           ▼                                  ▼                   │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │           Data Aggregation & Storage Layer             │    │
+│  │                                                          │    │
+│  │  ┌──────────────┐  ┌───────────────┐  ┌─────────────┐ │    │
+│  │  │   Customer   │  │ Distribution  │  │UsageSnapshot│ │    │
+│  │  │              │  │               │  │             │ │    │
+│  │  │ customer_id  │◄─┤ distribution  │◄─┤ time-series │ │    │
+│  │  │ name         │  │ customer_id   │  │ data        │ │    │
+│  │  │ created_at   │  │ bucket_id     │  │ 5min grain  │ │    │
+│  │  └──────────────┘  │ status        │  └─────────────┘ │    │
+│  │                    │ disabled_at   │                   │    │
+│  │  ┌──────────────┐  └───────────────┘  ┌─────────────┐ │    │
+│  │  │BillingEvent  │                      │  ShedLock   │ │    │
+│  │  │              │                      │             │ │    │
+│  │  │ Idempotency  │                      │ HA locking  │ │    │
+│  │  │ tracking     │                      │ mechanism   │ │    │
+│  │  └──────────────┘                      └─────────────┘ │    │
+│  └────────────────────────────────────────────────────────┘    │
+│           │                                                     │
+│           ▼                                                     │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │              Integration Layer                          │    │
+│  │  ┌───────────────────┐  ┌────────────────────────┐    │    │
+│  │  │ BillingEvent      │  │ CdnDisable             │    │    │
+│  │  │ Publisher         │  │ Service                │    │    │
+│  │  │                   │  │                        │    │    │
+│  │  │ System.out.print  │  │ System.out.print       │    │    │
+│  │  └───────────────────┘  └────────────────────────┘    │    │
+│  └────────────────────────────────────────────────────────┘    │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │            Observability Layer                          │    │
+│  │  - Structured Logging (SLF4J)                          │    │
+│  │  - Metrics (Micrometer)                                │    │
+│  │  - Health Checks (Actuator)                            │    │
+│  └────────────────────────────────────────────────────────┘    │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Technology Stack
+
+- **Framework**: Spring Boot 3.0.0
+- **Java Version**: 17
+- **Database**: H2 (in-memory for challenge, PostgreSQL for production)
+- **Scheduling**: Spring `@Scheduled` + ShedLock
+- **Observability**: Spring Actuator + Micrometer
+- **AWS SDK**: CloudWatch 2.18.17, Cost Explorer 2.17.121
+- **Testing**: JUnit 5, Mockito, Spring Boot Test
+
+---
+
+## 📝 IMPLEMENTATION PHASES
+
+### Phase 1: Domain Model & Database Schema (30 min)
+
+#### Entities to Create
+
+**1.1 Customer Entity**
+```java
+@Entity
+@Table(name = "customer")
+public class Customer {
+    @Id
+    @Column(name = "customer_id")
+    private String customerId;
+    
+    private String name;
+    
+    @Column(name = "created_at")
+    private Instant createdAt;
+    
+    @OneToMany(mappedBy = "customer")
+    private List<Distribution> distributions;
+}
+```
+
+**1.2 Distribution Entity**
+```java
+@Entity
+@Table(name = "distribution")
+public class Distribution {
+    @Id
+    @Column(name = "distribution_id")
+    private String distributionId;
+    
+    @ManyToOne
+    @JoinColumn(name = "customer_id")
+    private Customer customer;
+    
+    @Column(name = "bucket_id")
+    private String bucketId;
+    
+    @Enumerated(EnumType.STRING)
+    private DistributionStatus status; // ACTIVE, DISABLED
+    
+    @Column(name = "disabled_at")
+    private Instant disabledAt;
+    
+    @Column(name = "disable_reason")
+    private String disableReason;
+    
+    @Version
+    private Long version; // Optimistic locking for HA
+}
+```
+
+**1.3 UsageSnapshot Entity (Time-Series)**
+```java
+@Entity
+@Table(name = "usage_snapshot", indexes = {
+    @Index(name = "idx_customer_time", columnList = "customer_id,snapshot_time"),
+    @Index(name = "idx_dist_time_source", columnList = "distribution_id,snapshot_time,source")
+})
+public class UsageSnapshot {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(name = "distribution_id")
+    private String distributionId;
+    
+    @Column(name = "customer_id")
+    private String customerId;
+    
+    @Column(name = "snapshot_time")
+    private Instant snapshotTime;
+    
+    @Column(name = "data_transfer_gb")
+    private Double dataTransferGb;
+    
+    @Enumerated(EnumType.STRING)
+    private UsageDataSource source; // CLOUDWATCH, COST_EXPLORER
+    
+    @Column(name = "period_start")
+    private Instant periodStart;
+    
+    @Column(name = "period_end")
+    private Instant periodEnd;
+}
+```
+
+**1.4 BillingEvent Entity (Idempotency Tracking)**
+```java
+@Entity
+@Table(name = "billing_event", uniqueConstraints = {
+    @UniqueConstraint(name = "uk_billing", 
+                     columnNames = {"customer_id", "period_start", "period_end"})
+})
+public class BillingEvent {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(name = "customer_id")
+    private String customerId;
+    
+    @Column(name = "period_start")
+    private Instant periodStart;
+    
+    @Column(name = "period_end")
+    private Instant periodEnd;
+    
+    @Column(name = "traffic_usage_gb")
+    private Double trafficUsageGb;
+    
+    @Column(name = "sent_at")
+    private Instant sentAt;
+    
+    @Enumerated(EnumType.STRING)
+    private BillingEventStatus status; // PENDING, SENT, FAILED
+}
+```
+
+#### Repositories
+
+**1.5 Create Spring Data JPA Repositories**
+```java
+public interface CustomerRepository extends JpaRepository<Customer, String> {
+}
+
+public interface DistributionRepository extends JpaRepository<Distribution, String> {
+    List<Distribution> findByStatus(DistributionStatus status);
+    List<Distribution> findByCustomer_CustomerId(String customerId);
+}
+
+public interface UsageSnapshotRepository extends JpaRepository<UsageSnapshot, Long> {
+    @Query("SELECT u FROM UsageSnapshot u WHERE u.customerId = :customerId " +
+           "AND u.snapshotTime >= :from AND u.snapshotTime <= :to " +
+           "ORDER BY u.snapshotTime")
+    List<UsageSnapshot> findByCustomerAndTimeRange(
+        @Param("customerId") String customerId,
+        @Param("from") Instant from,
+        @Param("to") Instant to
+    );
+    
+    @Query("SELECT SUM(u.dataTransferGb) FROM UsageSnapshot u " +
+           "WHERE u.distributionId = :distributionId " +
+           "AND u.snapshotTime >= :from AND u.snapshotTime <= :to " +
+           "AND u.source = :source")
+    Double sumUsageByDistributionAndTimeRange(
+        @Param("distributionId") String distributionId,
+        @Param("from") Instant from,
+        @Param("to") Instant to,
+        @Param("source") UsageDataSource source
+    );
+}
+
+public interface BillingEventRepository extends JpaRepository<BillingEvent, Long> {
+    Optional<BillingEvent> findByCustomerIdAndPeriodStartAndPeriodEnd(
+        String customerId, Instant periodStart, Instant periodEnd
+    );
+    
+    @Query("SELECT MAX(b.periodEnd) FROM BillingEvent b " +
+           "WHERE b.customerId = :customerId AND b.status = 'SENT'")
+    Optional<Instant> findLastBillingPeriodEnd(@Param("customerId") String customerId);
+}
+```
+
+#### Database Schema
+
+**1.6 schema.sql**
+```sql
+-- Customer entity removed - using customer_id from header
+-- CREATE TABLE customer (
+    customer_id VARCHAR(255) PRIMARY KEY,
+    name VARCHAR(255),
+    created_at TIMESTAMP
+);
+
+CREATE TABLE distribution (
+    distribution_id VARCHAR(255) PRIMARY KEY,
+    customer_id VARCHAR(255) NOT NULL,
+    bucket_id VARCHAR(255),
+    status VARCHAR(50) NOT NULL,
+    disabled_at TIMESTAMP,
+    disable_reason VARCHAR(500),
+    version BIGINT NOT NULL DEFAULT 0,
+    FOREIGN KEY (customer_id) REFERENCES customer(customer_id)
+);
+
+CREATE TABLE usage_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    distribution_id VARCHAR(255) NOT NULL,
+    customer_id VARCHAR(255) NOT NULL,
+    snapshot_time TIMESTAMP NOT NULL,
+    data_transfer_gb DOUBLE NOT NULL,
+    source VARCHAR(50) NOT NULL,
+    period_start TIMESTAMP NOT NULL,
+    period_end TIMESTAMP NOT NULL,
+    FOREIGN KEY (distribution_id) REFERENCES distribution(distribution_id)
+);
+
+CREATE INDEX idx_customer_time ON usage_snapshot(customer_id, snapshot_time);
+CREATE INDEX idx_dist_time_source ON usage_snapshot(distribution_id, snapshot_time, source);
+
+CREATE TABLE billing_event (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id VARCHAR(255) NOT NULL,
+    period_start TIMESTAMP NOT NULL,
+    period_end TIMESTAMP NOT NULL,
+    traffic_usage_gb DOUBLE NOT NULL,
+    sent_at TIMESTAMP,
+    status VARCHAR(50) NOT NULL,
+    CONSTRAINT uk_billing UNIQUE (customer_id, period_start, period_end)
+);
+
+-- ShedLock table for distributed locking
+CREATE TABLE shedlock (
+    name VARCHAR(64) PRIMARY KEY,
+    lock_until TIMESTAMP NOT NULL,
+    locked_at TIMESTAMP NOT NULL,
+    locked_by VARCHAR(255) NOT NULL
+);
+```
+
+**1.7 data.sql (Seed Data)**
+```sql
+-- Seed customers
+INSERT INTO customer (customer_id, name, created_at) VALUES
+('customer#1', 'Acme Corporation', CURRENT_TIMESTAMP),
+('customer#2', 'TechStart Inc', CURRENT_TIMESTAMP),
+('customer#3', 'MediaStream Ltd', CURRENT_TIMESTAMP);
+
+-- Seed distributions (map to mock data in CloudWatchClient/CostExplorerClient)
+INSERT INTO distribution (distribution_id, customer_id, bucket_id, status, version) VALUES
+('dist-uuid-1', 'customer#1', 'bucket#1', 'ACTIVE', 0),
+('dist-uuid-2', 'customer#2', 'bucket#2', 'ACTIVE', 0),
+('dist-uuid-3', 'customer#1', 'bucket#3', 'ACTIVE', 0);
+```
+
+**Deliverables:**
+- [ ] 4 JPA entities with proper relationships
+- [ ] 4 Spring Data repositories with custom queries
+- [ ] schema.sql with indexes and constraints
+- [ ] data.sql with seed data
+- [ ] Enums: DistributionStatus, UsageDataSource, BillingEventStatus
+
+---
+
+### Phase 2: AWS Data Retrieval Services (45 min)
+
+#### 2.1 CloudWatchService
+
+**Purpose**: Retrieve usage data from CloudWatch (3-hour window, eventually consistent)
+
+```java
+@Service
+@Slf4j
+public class CloudWatchService {
+    
+    private final CloudWatchClient cloudWatchClient;
+    private final UsageSnapshotRepository usageSnapshotRepository;
+    private final DistributionRepository distributionRepository;
+    
+    /**
+     * Retrieve recent usage from CloudWatch and store as snapshots
+     * @param from Start time (typically NOW - 3 hours)
+     * @param to End time (typically NOW)
+     * @return List of created usage snapshots
+     */
+    public List<UsageSnapshot> retrieveAndStoreRecentUsage(Instant from, Instant to) {
+        log.info("Retrieving CloudWatch metrics from {} to {}", from, to);
+        
+        GetMetricDataResponse response = cloudWatchClient.getMetrics(from, to);
+        List<UsageSnapshot> snapshots = new ArrayList<>();
+        
+        for (MetricDataResult result : response.metricDataResults()) {
+            String distributionId = extractDistributionId(result.label());
+            Distribution distribution = distributionRepository.findById(distributionId)
+                .orElse(null);
+            
+            if (distribution == null) {
+                log.warn("Distribution not found: {}", distributionId);
+                continue;
+            }
+            
+            // CloudWatch returns values in bytes, convert to GB
+            Double usageGb = result.values().stream()
+                .mapToDouble(Double::doubleValue)
+                .sum() / (1024.0 * 1024.0 * 1024.0);
+            
+            UsageSnapshot snapshot = new UsageSnapshot();
+            snapshot.setDistributionId(distributionId);
+            snapshot.setCustomerId(distribution.getCustomer().getCustomerId());
+            snapshot.setSnapshotTime(Instant.now());
+            snapshot.setDataTransferGb(usageGb);
+            snapshot.setSource(UsageDataSource.CLOUDWATCH);
+            snapshot.setPeriodStart(from);
+            snapshot.setPeriodEnd(to);
+            
+            snapshots.add(usageSnapshotRepository.save(snapshot));
+        }
+        
+        log.info("Stored {} CloudWatch snapshots", snapshots.size());
+        return snapshots;
+    }
+    
+    /**
+     * Calculate usage for a distribution within a sliding window
+     * Used for usage capping checks (15min, 3hr windows)
+     */
+    public Double getUsageForWindow(String distributionId, Duration window) {
+        Instant to = Instant.now();
+        Instant from = to.minus(window);
+        
+        Double usage = usageSnapshotRepository.sumUsageByDistributionAndTimeRange(
+            distributionId, from, to, UsageDataSource.CLOUDWATCH
+        );
+        
+        return usage != null ? usage : 0.0;
+    }
+    
+    /**
+     * Check if distribution usage exceeds threshold within window
+     */
+    public boolean exceedsThreshold(String distributionId, Double thresholdGb, Duration window) {
+        Double usage = getUsageForWindow(distributionId, window);
+        boolean exceeds = usage >= thresholdGb;
+        
+        if (exceeds) {
+            log.warn("Distribution {} exceeded threshold: {} GB (limit: {} GB) in {}",
+                distributionId, usage, thresholdGb, window);
+        }
+        
+        return exceeds;
+    }
+    
+    private String extractDistributionId(String label) {
+        // Label format: "Distribution dist-uuid-1"
+        return label.substring(label.lastIndexOf(" ") + 1);
+    }
+}
+```
+
+#### 2.2 CostExplorerService
+
+**Purpose**: Retrieve accurate billing data from Cost Explorer (24h delayed)
+
+```java
+@Service
+@Slf4j
+public class CostExplorerService {
+    
+    private final CostExplorerClient costExplorerClient;
+    private final UsageSnapshotRepository usageSnapshotRepository;
+    private final DistributionRepository distributionRepository;
+    
+    /**
+     * Retrieve billing-accurate usage from Cost Explorer
+     * Note: Data is delayed by ~24 hours
+     */
+    public List<UsageSnapshot> retrieveAndStoreBillingUsage(Instant from, Instant to) {
+        log.info("Retrieving Cost Explorer data from {} to {}", from, to);
+        
+        List<UsageSnapshot> snapshots = new ArrayList<>();
+        List<Distribution> distributions = distributionRepository.findAll();
+        
+        for (Distribution distribution : distributions) {
+            GetCostAndUsageResponse response = costExplorerClient.retrieveUsage(
+                from, to, distribution.getDistributionId()
+            );
+            
+            Double dataTransferBytes = extractDataTransferBytes(response);
+            Double usageGb = dataTransferBytes / (1024.0 * 1024.0 * 1024.0);
+            
+            UsageSnapshot snapshot = new UsageSnapshot();
+            snapshot.setDistributionId(distribution.getDistributionId());
+            snapshot.setCustomerId(distribution.getCustomer().getCustomerId());
+            snapshot.setSnapshotTime(Instant.now());
+            snapshot.setDataTransferGb(usageGb);
+            snapshot.setSource(UsageDataSource.COST_EXPLORER);
+            snapshot.setPeriodStart(from);
+            snapshot.setPeriodEnd(to);
+            
+            snapshots.add(usageSnapshotRepository.save(snapshot));
+        }
+        
+        log.info("Stored {} Cost Explorer snapshots", snapshots.size());
+        return snapshots;
+    }
+    
+    /**
+     * Get aggregated usage per customer for billing
+     */
+    public Map<String, Double> getCustomerUsageForBilling(Instant from, Instant to) {
+        Map<String, Double> customerUsage = new HashMap<>();
+        
+        List<Customer> customers = customerRepository.findAll();
+        
+        for (Customer customer : customers) {
+            Double totalUsage = usageSnapshotRepository
+                .sumUsageByCustomerAndTimeRange(
+                    customer.getCustomerId(), from, to, UsageDataSource.COST_EXPLORER
+                );
+            
+            customerUsage.put(customer.getCustomerId(), totalUsage != null ? totalUsage : 0.0);
+        }
+        
+        return customerUsage;
+    }
+    
+    private Double extractDataTransferBytes(GetCostAndUsageResponse response) {
+        return response.resultsByTime().stream()
+            .flatMap(result -> result.groups().stream())
+            .filter(group -> group.keys().contains("-DataTransfer-Out-Bytes"))
+            .findFirst()
+            .map(group -> group.metrics().get("UsageQuantity"))
+            .map(metricValue -> Double.parseDouble(metricValue.amount()))
+            .orElse(0.0);
+    }
+}
+```
+
+#### 2.3 UsageAggregationService
+
+**Purpose**: Aggregate and transform usage data for API responses
+
+```java
+@Service
+@Slf4j
+public class UsageAggregationService {
+    
+    private final UsageSnapshotRepository usageSnapshotRepository;
+    
+    /**
+     * Aggregate usage by day with 24-hour resolution
+     * Selects data source based on recency
+     */
+    public List<DailyUsageDTO> aggregateUsageByDay(
+            String customerId, Instant from, Instant to) {
+        
+        List<UsageSnapshot> snapshots = usageSnapshotRepository
+            .findByCustomerAndTimeRange(customerId, from, to);
+        
+        // Group by day
+        Map<LocalDate, DailyUsageDTO> dailyUsageMap = new HashMap<>();
+        
+        for (UsageSnapshot snapshot : snapshots) {
+            LocalDate day = LocalDateTime.ofInstant(snapshot.getSnapshotTime(), 
+                                                   ZoneOffset.UTC).toLocalDate();
+            
+            dailyUsageMap.compute(day, (k, v) -> {
+                if (v == null) {
+                    v = new DailyUsageDTO();
+                    v.setDate(day);
+                    v.setUsageGb(0.0);
+                }
+                v.setUsageGb(v.getUsageGb() + snapshot.getDataTransferGb());
+                v.setSource(snapshot.getSource());
+                return v;
+            });
+        }
+        
+        return dailyUsageMap.values().stream()
+            .sorted(Comparator.comparing(DailyUsageDTO::getDate))
+            .collect(Collectors.toList());
+    }
+    
+    /**
+     * Calculate total usage for a customer in a period
+     */
+    public Double calculateTotalUsage(String customerId, Instant from, Instant to) {
+        List<UsageSnapshot> snapshots = usageSnapshotRepository
+            .findByCustomerAndTimeRange(customerId, from, to);
+        
+        return snapshots.stream()
+            .mapToDouble(UsageSnapshot::getDataTransferGb)
+            .sum();
+    }
+    
+    /**
+     * Select appropriate data source based on recency
+     * - Recent data (< 24h): Use CloudWatch (15min delay)
+     * - Historical data (>= 24h): Use Cost Explorer (accurate)
+     */
+    public UsageDataSource selectDataSource(Instant dataTimestamp) {
+        Instant now = Instant.now();
+        Duration age = Duration.between(dataTimestamp, now);
+        
+        return age.toHours() < 24 
+            ? UsageDataSource.CLOUDWATCH 
+            : UsageDataSource.COST_EXPLORER;
+    }
+}
+```
+
+**Deliverables:**
+- [ ] CloudWatchService with usage retrieval and threshold checking
+- [ ] CostExplorerService with billing data retrieval
+- [ ] UsageAggregationService with daily aggregation logic
+- [ ] DTOs: DailyUsageDTO
+- [ ] Unit tests for each service
+
+---
+
+### Phase 3: Scheduled Jobs with HA Support (60 min)
+
+#### 3.1 ShedLock Configuration
+
+**Add Dependencies to pom.xml:**
+```xml
+<dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-spring</artifactId>
+    <version>4.42.0</version>
+</dependency>
+<dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-provider-jdbc-template</artifactId>
+    <version>4.42.0</version>
+</dependency>
+```
+
+**ShedLock Configuration Class:**
+```java
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "PT10M")
+public class SchedulingConfig {
+    
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(JdbcTemplateLockProvider.Configuration.builder()
+            .withJdbcTemplate(new JdbcTemplate(dataSource))
+            .usingDbTime()
+            .build()
+        );
+    }
+}
+```
+
+#### 3.2 Billing Scheduled Job
+
+**Purpose**: Send billing events to billing system every 24 hours
+
+```java
+@Component
+@Slf4j
+public class BillingScheduledJob {
+    
+    private final CustomerRepository customerRepository;
+    private final BillingEventRepository billingEventRepository;
+    private final CostExplorerService costExplorerService;
+    private final BillingEventPublisher billingEventPublisher;
+    private final UsageMetricsService metricsService;
+    
+    /**
+     * Runs every 24 hours at midnight UTC
+     * Only one instance will execute due to ShedLock
+     */
+    @Scheduled(cron = "0 0 0 * * *") // Midnight UTC daily
+    @SchedulerLock(
+        name = "billingJob",
+        lockAtMostFor = "PT30M",  // Release lock after 30 min max
+        lockAtLeastFor = "PT5M"   // Hold lock for at least 5 min
+    )
+    public void sendBillingEvents() {
+        log.info("Starting billing job execution");
+        Instant jobStart = Instant.now();
+        int processedCount = 0;
+        int errorCount = 0;
+        
+        List<Customer> customers = customerRepository.findAll();
+        
+        for (Customer customer : customers) {
+            try {
+                processBillingForCustomer(customer);
+                processedCount++;
+            } catch (Exception e) {
+                log.error("Failed to process billing for customer {}", 
+                         customer.getCustomerId(), e);
+                errorCount++;
+            }
+        }
+        
+        Duration elapsed = Duration.between(jobStart, Instant.now());
+        log.info("Billing job completed. Processed: {}, Errors: {}, Duration: {}s",
+                processedCount, errorCount, elapsed.getSeconds());
+        
+        metricsService.recordBillingJobExecution(processedCount, errorCount, elapsed);
+    }
+    
+    @Transactional
+    void processBillingForCustomer(Customer customer) {
+        String customerId = customer.getCustomerId();
+        
+        // Find last billing period end, default to 24 hours ago
+        Instant periodEnd = Instant.now().truncatedTo(ChronoUnit.DAYS);
+        Instant periodStart = billingEventRepository
+            .findLastBillingPeriodEnd(customerId)
+            .orElse(periodEnd.minus(Duration.ofDays(1)));
+        
+        log.info("Processing billing for customer {} from {} to {}", 
+                customerId, periodStart, periodEnd);
+        
+        // Check if billing event already exists (idempotency)
+        Optional<BillingEvent> existing = billingEventRepository
+            .findByCustomerIdAndPeriodStartAndPeriodEnd(customerId, periodStart, periodEnd);
+        
+        if (existing.isPresent()) {
+            log.info("Billing event already exists for customer {} (period {} to {}), skipping",
+                    customerId, periodStart, periodEnd);
+            return;
+        }
+        
+        // Calculate usage from Cost Explorer (accurate billing data)
+        Map<String, Double> usage = costExplorerService
+            .getCustomerUsageForBilling(periodStart, periodEnd);
+        Double totalUsageGb = usage.getOrDefault(customerId, 0.0);
+        
+        // Create billing event record
+        BillingEvent event = new BillingEvent();
+        event.setCustomerId(customerId);
+        event.setPeriodStart(periodStart);
+        event.setPeriodEnd(periodEnd);
+        event.setTrafficUsageGb(totalUsageGb);
+        event.setStatus(BillingEventStatus.PENDING);
+        
+        billingEventRepository.save(event);
+        
+        // Publish to billing system
+        billingEventPublisher.publishBillingEvent(event);
+        
+        // Mark as sent
+        event.setStatus(BillingEventStatus.SENT);
+        event.setSentAt(Instant.now());
+        billingEventRepository.save(event);
+        
+        log.info("Billing event sent for customer {}: {} GB", customerId, totalUsageGb);
+        metricsService.recordBillingEvent(customerId, totalUsageGb);
+    }
+}
+```
+
+#### 3.3 Usage Capping Scheduled Job
+
+**Purpose**: Check usage limits and disable CDN if exceeded
+
+```java
+@Component
+@Slf4j
+public class UsageCappingScheduledJob {
+    
+    private final DistributionRepository distributionRepository;
+    private final CloudWatchService cloudWatchService;
+    private final CdnDisableService cdnDisableService;
+    private final UsageMetricsService metricsService;
+    
+    // Thresholds
+    private static final double LIMIT_15MIN_GB = 100.0;
+    private static final double LIMIT_3HR_GB = 500.0;
+    private static final Duration WINDOW_15MIN = Duration.ofMinutes(15);
+    private static final Duration WINDOW_3HR = Duration.ofHours(3);
+    
+    /**
+     * Runs every minute to check usage limits
+     * Only one instance will execute due to ShedLock
+     */
+    @Scheduled(fixedRate = 60000) // Every 1 minute
+    @SchedulerLock(
+        name = "usageCappingJob",
+        lockAtMostFor = "PT5M",
+        lockAtLeastFor = "PT30S"
+    )
+    public void checkUsageLimits() {
+        log.debug("Starting usage capping check");
+        
+        List<Distribution> activeDistributions = distributionRepository
+            .findByStatus(DistributionStatus.ACTIVE);
+        
+        int checkedCount = 0;
+        int cappedCount = 0;
+        
+        for (Distribution distribution : activeDistributions) {
+            try {
+                boolean capped = checkAndCapDistribution(distribution);
+                if (capped) {
+                    cappedCount++;
+                }
+                checkedCount++;
+            } catch (Exception e) {
+                log.error("Error checking distribution {}", 
+                         distribution.getDistributionId(), e);
+            }
+        }
+        
+        log.debug("Usage capping check completed. Checked: {}, Capped: {}", 
+                 checkedCount, cappedCount);
+    }
+    
+    @Transactional
+    boolean checkAndCapDistribution(Distribution distribution) {
+        String distributionId = distribution.getDistributionId();
+        
+        // Check 15-minute limit
+        if (cloudWatchService.exceedsThreshold(distributionId, LIMIT_15MIN_GB, WINDOW_15MIN)) {
+            double usage = cloudWatchService.getUsageForWindow(distributionId, WINDOW_15MIN);
+            String reason = String.format("Exceeded 100 GB limit in 15 minutes (%.2f GB)", usage);
+            disableDistribution(distribution, reason, usage);
+            metricsService.recordCappingEvent("15min", distributionId, usage);
+            return true;
+        }
+        
+        // Check 3-hour limit
+        if (cloudWatchService.exceedsThreshold(distributionId, LIMIT_3HR_GB, WINDOW_3HR)) {
+            double usage = cloudWatchService.getUsageForWindow(distributionId, WINDOW_3HR);
+            String reason = String.format("Exceeded 500 GB limit in 3 hours (%.2f GB)", usage);
+            disableDistribution(distribution, reason, usage);
+            metricsService.recordCappingEvent("3hr", distributionId, usage);
+            return true;
+        }
+        
+        return false;
+    }
+    
+    private void disableDistribution(Distribution distribution, String reason, double usageGb) {
+        log.warn("Disabling distribution {}: {}", distribution.getDistributionId(), reason);
+        
+        distribution.setStatus(DistributionStatus.DISABLED);
+        distribution.setDisabledAt(Instant.now());
+        distribution.setDisableReason(reason);
+        distributionRepository.save(distribution);
+        
+        cdnDisableService.disableDistribution(
+            distribution.getDistributionId(), reason, usageGb
+        );
+    }
+}
+```
+
+#### 3.4 Data Collection Scheduled Job
+
+**Purpose**: Periodically collect usage data from AWS sources
+
+```java
+@Component
+@Slf4j
+public class DataCollectionScheduledJob {
+    
+    private final CloudWatchService cloudWatchService;
+    private final CostExplorerService costExplorerService;
+    private final UsageMetricsService metricsService;
+    
+    /**
+     * Runs every 5 minutes to collect CloudWatch data
+     */
+    @Scheduled(fixedRate = 300000) // Every 5 minutes
+    @SchedulerLock(
+        name = "dataCollectionJob",
+        lockAtMostFor = "PT10M",
+        lockAtLeastFor = "PT2M"
+    )
+    public void collectUsageData() {
+        log.debug("Starting data collection job");
+        
+        try {
+            // Collect CloudWatch data (last 3 hours)
+            Instant to = Instant.now();
+            Instant from = to.minus(Duration.ofHours(3));
+            
+            List<UsageSnapshot> cloudWatchSnapshots = 
+                cloudWatchService.retrieveAndStoreRecentUsage(from, to);
+            
+            log.info("Collected {} CloudWatch snapshots", cloudWatchSnapshots.size());
+            metricsService.recordDataCollection("cloudwatch", cloudWatchSnapshots.size());
+            
+        } catch (Exception e) {
+            log.error("Failed to collect CloudWatch data", e);
+        }
+    }
+    
+    /**
+     * Runs daily to collect Cost Explorer data for yesterday
+     * (Cost Explorer data is delayed by ~24 hours)
+     */
+    @Scheduled(cron = "0 30 1 * * *") // 1:30 AM UTC daily
+    @SchedulerLock(
+        name = "costExplorerCollectionJob",
+        lockAtMostFor = "PT30M",
+        lockAtLeastFor = "PT5M"
+    )
+    public void collectBillingData() {
+        log.info("Starting Cost Explorer data collection");
+        
+        try {
+            // Collect yesterday's data (24h delay)
+            Instant to = Instant.now().minus(Duration.ofDays(1))
+                .truncatedTo(ChronoUnit.DAYS);
+            Instant from = to.minus(Duration.ofDays(1));
+            
+            List<UsageSnapshot> costExplorerSnapshots = 
+                costExplorerService.retrieveAndStoreBillingUsage(from, to);
+            
+            log.info("Collected {} Cost Explorer snapshots", costExplorerSnapshots.size());
+            metricsService.recordDataCollection("costexplorer", costExplorerSnapshots.size());
+            
+        } catch (Exception e) {
+            log.error("Failed to collect Cost Explorer data", e);
+        }
+    }
+}
+```
+
+**Deliverables:**
+- [ ] ShedLock configuration for HA
+- [ ] BillingScheduledJob (24h cadence)
+- [ ] UsageCappingScheduledJob (1min cadence)
+- [ ] DataCollectionScheduledJob (5min cadence)
+- [ ] Proper transaction management
+- [ ] Comprehensive error handling
+
+---
+
+### Phase 4: REST API Implementation (30 min)
+
+#### 4.1 Usage Controller
+
+```java
+@RestController
+@RequestMapping("/api/usage")
+@Slf4j
+public class UsageController {
+    
+    private final UsageAggregationService aggregationService;
+    private final CustomerRepository customerRepository;
+    
+    /**
+     * Get usage data for a customer
+     * Header: X-Customer-Id (required)
+     * Params: from (optional), to (optional)
+     * Returns: Daily usage with 24-hour resolution
+     */
+    @GetMapping
+    public ResponseEntity<UsageResponse> getUsage(
+            @RequestHeader("X-Customer-Id") String customerId,
+            @RequestParam(required = false) 
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
+            @RequestParam(required = false) 
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to) {
+        
+        log.info("Usage request for customer {}, from: {}, to: {}", customerId, from, to);
+        
+        // Validate customer exists
+        Customer customer = customerRepository.findById(customerId)
+            .orElseThrow(() -> new CustomerNotFoundException(customerId));
+        
+        // Default to last 30 days if not specified
+        if (to == null) {
+            to = Instant.now();
+        }
+        if (from == null) {
+            from = to.minus(Duration.ofDays(30));
+        }
+        
+        // Validate date range
+        if (from.isAfter(to)) {
+            throw new InvalidDateRangeException("'from' must be before 'to'");
+        }
+        
+        // Aggregate usage by day
+        List<DailyUsageDTO> dailyUsage = aggregationService
+            .aggregateUsageByDay(customerId, from, to);
+        
+        Double totalUsage = aggregationService
+            .calculateTotalUsage(customerId, from, to);
+        
+        UsageResponse response = UsageResponse.builder()
+            .customerId(customerId)
+            .periodStart(from)
+            .periodEnd(to)
+            .totalUsageGb(totalUsage)
+            .dailyUsage(dailyUsage)
+            .build();
+        
+        log.info("Returning usage for customer {}: {} GB", customerId, totalUsage);
+        return ResponseEntity.ok(response);
+    }
+}
+```
+
+#### 4.2 DTOs
+
+```java
+@Data
+@Builder
+public class UsageResponse {
+    private String customerId;
+    private Instant periodStart;
+    private Instant periodEnd;
+    private Double totalUsageGb;
+    private List<DailyUsageDTO> dailyUsage;
+}
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class DailyUsageDTO {
+    private LocalDate date;
+    private Double usageGb;
+    private UsageDataSource source; // CLOUDWATCH or COST_EXPLORER
+}
+
+@Data
+@Builder
+public class ErrorResponse {
+    private int status;
+    private String error;
+    private String message;
+    private Instant timestamp;
+}
+```
+
+#### 4.3 Exception Handling
+
+```java
+@ControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(CustomerNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleCustomerNotFound(CustomerNotFoundException ex) {
+        log.warn("Customer not found: {}", ex.getMessage());
+        
+        ErrorResponse error = ErrorResponse.builder()
+            .status(HttpStatus.NOT_FOUND.value())
+            .error("Customer Not Found")
+            .message(ex.getMessage())
+            .timestamp(Instant.now())
+            .build();
+        
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(error);
+    }
+    
+    @ExceptionHandler(InvalidDateRangeException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidDateRange(InvalidDateRangeException ex) {
+        log.warn("Invalid date range: {}", ex.getMessage());
+        
+        ErrorResponse error = ErrorResponse.builder()
+            .status(HttpStatus.BAD_REQUEST.value())
+            .error("Invalid Date Range")
+            .message(ex.getMessage())
+            .timestamp(Instant.now())
+            .build();
+        
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(error);
+    }
+    
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException ex) {
+        log.warn("Missing required header: {}", ex.getMessage());
+        
+        ErrorResponse error = ErrorResponse.builder()
+            .status(HttpStatus.BAD_REQUEST.value())
+            .error("Missing Header")
+            .message("X-Customer-Id header is required")
+            .timestamp(Instant.now())
+            .build();
+        
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(error);
+    }
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGenericException(Exception ex) {
+        log.error("Unexpected error", ex);
+        
+        ErrorResponse error = ErrorResponse.builder()
+            .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
+            .error("Internal Server Error")
+            .message("An unexpected error occurred")
+            .timestamp(Instant.now())
+            .build();
+        
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(error);
+    }
+}
+```
+
+#### 4.4 Custom Exceptions
+
+```java
+public class CustomerNotFoundException extends RuntimeException {
+    public CustomerNotFoundException(String customerId) {
+        super("Customer not found: " + customerId);
+    }
+}
+
+public class InvalidDateRangeException extends RuntimeException {
+    public InvalidDateRangeException(String message) {
+        super(message);
+    }
+}
+```
+
+**Deliverables:**
+- [ ] UsageController with GET /api/usage endpoint
+- [ ] Request/Response DTOs
+- [ ] Global exception handler
+- [ ] Custom exceptions
+- [ ] Request validation
+- [ ] Integration tests
+
+---
+
+### Phase 5: Integration Layer (20 min)
+
+#### 5.1 Billing Event Publisher
+
+```java
+@Service
+@Slf4j
+public class BillingEventPublisher {
+    
+    /**
+     * Publish billing event to billing system
+     * In production: Would use Kafka/RabbitMQ
+     * For challenge: Print to console
+     */
+    public void publishBillingEvent(BillingEvent event) {
+        String json = formatBillingEvent(event);
+        
+        // Mock: Print to console
+        System.out.println("=====================================================");
+        System.out.println("BILLING EVENT PUBLISHED");
+        System.out.println("=====================================================");
+        System.out.println(json);
+        System.out.println("=====================================================");
+        
+        log.info("Published billing event for customer {} (period {} to {})", 
+                event.getCustomerId(), event.getPeriodStart(), event.getPeriodEnd());
+        
+        // In production:
+        // kafkaTemplate.send("billing-events", event.getCustomerId(), json);
+    }
+    
+    private String formatBillingEvent(BillingEvent event) {
+        return String.format("""
+            {
+              "type": "EVENT_CDN_USAGE",
+              "payload": {
+                "id": "%s",
+                "customerId": "%s",
+                "startPeriod": "%s",
+                "endPeriod": "%s",
+                "trafficUsageGb": "%.2f"
+              }
+            }
+            """,
+            event.getId(),
+            event.getCustomerId(),
+            event.getPeriodStart().toString(),
+            event.getPeriodEnd().toString(),
+            event.getTrafficUsageGb()
+        );
+    }
+}
+```
+
+#### 5.2 CDN Disable Service
+
+```java
+@Service
+@Slf4j
+public class CdnDisableService {
+    
+    /**
+     * Disable CDN distribution due to usage limit exceeded
+     * In production: Would call AWS CloudFront API to disable distribution
+     * For challenge: Mock with status update and event publication
+     */
+    public void disableDistribution(String distributionId, String reason, Double usageGb) {
+        String event = formatDisableEvent(distributionId, reason, usageGb);
+        
+        // Mock: Print to console
+        System.out.println("=====================================================");
+        System.out.println("CDN DISABLE EVENT");
+        System.out.println("=====================================================");
+        System.out.println(event);
+        System.out.println("=====================================================");
+        
+        log.warn("CDN distribution {} disabled: {}", distributionId, reason);
+        
+        // In production:
+        // 1. Call AWS CloudFront to disable distribution
+        // cloudFrontClient.updateDistribution(distributionId, enabled=false);
+        // 2. Publish event to message broker
+        // kafkaTemplate.send("cdn-events", distributionId, event);
+    }
+    
+    private String formatDisableEvent(String distributionId, String reason, Double usageGb) {
+        return String.format("""
+            {
+              "type": "EVENT_CDN_DISABLED",
+              "payload": {
+                "distributionId": "%s",
+                "reason": "%s",
+                "usageGb": "%.2f",
+                "timestamp": "%s"
+              }
+            }
+            """,
+            distributionId,
+            reason,
+            usageGb,
+            Instant.now().toString()
+        );
+    }
+}
+```
+
+**Deliverables:**
+- [ ] BillingEventPublisher with console output
+- [ ] CdnDisableService with console output
+- [ ] Proper event formatting
+- [ ] Production-ready comments for Kafka integration
+
+---
+
+### Phase 6: Observability & Monitoring (20 min)
+
+#### 6.1 Metrics Service
+
+```java
+@Service
+public class UsageMetricsService {
+    
+    private final MeterRegistry meterRegistry;
+    
+    public UsageMetricsService(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+    
+    public void recordBillingEvent(String customerId, Double usageGb) {
+        meterRegistry.counter("cdn.billing.events.sent", 
+            "customer", customerId).increment();
+        meterRegistry.gauge("cdn.billing.latest.usage.gb", 
+            Tags.of("customer", customerId), usageGb);
+    }
+    
+    public void recordBillingJobExecution(int processed, int errors, Duration duration) {
+        meterRegistry.counter("cdn.billing.job.executions").increment();
+        meterRegistry.counter("cdn.billing.job.customers.processed").increment(processed);
+        meterRegistry.counter("cdn.billing.job.errors").increment(errors);
+        meterRegistry.timer("cdn.billing.job.duration").record(duration);
+    }
+    
+    public void recordCappingEvent(String reason, String distributionId, Double usageGb) {
+        meterRegistry.counter("cdn.capping.events", 
+            "reason", reason,
+            "distribution", distributionId).increment();
+        meterRegistry.gauge("cdn.capping.usage.gb",
+            Tags.of("distribution", distributionId), usageGb);
+    }
+    
+    public void recordDataCollection(String source, int snapshotCount) {
+        meterRegistry.counter("cdn.data.collection.snapshots",
+            "source", source).increment(snapshotCount);
+    }
+    
+    public void recordApiRequest(String customerId, Duration responseTime) {
+        meterRegistry.counter("cdn.api.requests",
+            "customer", customerId).increment();
+        meterRegistry.timer("cdn.api.response.time").record(responseTime);
+    }
+}
+```
+
+#### 6.2 Health Indicators
+
+```java
+@Component
+public class AwsDataSourceHealthIndicator implements HealthIndicator {
+    
+    private final CloudWatchClient cloudWatchClient;
+    private final CostExplorerClient costExplorerClient;
+    
+    @Override
+    public Health health() {
+        try {
+            // Test CloudWatch connectivity
+            Instant now = Instant.now();
+            cloudWatchClient.getMetrics(now.minus(Duration.ofMinutes(5)), now);
+            
+            // Test Cost Explorer connectivity
+            costExplorerClient.retrieveUsage(
+                now.minus(Duration.ofDays(2)), 
+                now.minus(Duration.ofDays(1)), 
+                "test-dist"
+            );
+            
+            return Health.up()
+                .withDetail("cloudwatch", "available")
+                .withDetail("costExplorer", "available")
+                .withDetail("timestamp", Instant.now())
+                .build();
+                
+        } catch (Exception e) {
+            return Health.down()
+                .withDetail("error", e.getMessage())
+                .withDetail("timestamp", Instant.now())
+                .withException(e)
+                .build();
+        }
+    }
+}
+```
+
+#### 6.3 Request Logging Interceptor
+
+```java
+@Component
+public class RequestLoggingInterceptor implements HandlerInterceptor {
+    
+    private static final Logger log = LoggerFactory.getLogger(RequestLoggingInterceptor.class);
+    private static final String START_TIME_ATTR = "startTime";
+    
+    @Override
+    public boolean preHandle(HttpServletRequest request, 
+                            HttpServletResponse response, 
+                            Object handler) {
+        request.setAttribute(START_TIME_ATTR, Instant.now());
+        
+        log.info("API Request: {} {} - Customer: {}", 
+                request.getMethod(),
+                request.getRequestURI(),
+                request.getHeader("X-Customer-Id"));
+        
+        return true;
+    }
+    
+    @Override
+    public void afterCompletion(HttpServletRequest request, 
+                               HttpServletResponse response, 
+                               Object handler, 
+                               Exception ex) {
+        Instant startTime = (Instant) request.getAttribute(START_TIME_ATTR);
+        Duration duration = Duration.between(startTime, Instant.now());
+        
+        log.info("API Response: {} {} - Status: {} - Duration: {}ms",
+                request.getMethod(),
+                request.getRequestURI(),
+                response.getStatus(),
+                duration.toMillis());
+    }
+}
+
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
+    
+    @Autowired
+    private RequestLoggingInterceptor requestLoggingInterceptor;
+    
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(requestLoggingInterceptor);
+    }
+}
+```
+
+#### 6.4 Application Configuration
+
+**application.properties:**
+```properties
+# Application
+spring.application.name=cdn-challenge
+
+# Database (H2)
+spring.datasource.url=jdbc:h2:mem:cdndb
+spring.datasource.driverClassName=org.h2.Driver
+spring.datasource.username=sa
+spring.datasource.password=
+spring.jpa.database-platform=org.hibernate.dialect.H2Dialect
+spring.jpa.hibernate.ddl-auto=none
+spring.sql.init.mode=always
+spring.sql.init.schema-locations=classpath:schema.sql
+spring.sql.init.data-locations=classpath:data.sql
+
+# H2 Console (for debugging)
+spring.h2.console.enabled=true
+spring.h2.console.path=/h2-console
+
+# Logging
+logging.level.root=INFO
+logging.level.com.bitmovin.platform.challenge=DEBUG
+logging.level.org.springframework.scheduling=DEBUG
+logging.pattern.console=%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n
+
+# Actuator
+management.endpoints.web.exposure.include=health,metrics,info,scheduledtasks
+management.endpoint.health.show-details=always
+management.metrics.export.prometheus.enabled=true
+
+# Scheduling
+spring.task.scheduling.pool.size=5
+```
+
+**Deliverables:**
+- [ ] UsageMetricsService with custom metrics
+- [ ] AwsDataSourceHealthIndicator
+- [ ] Request logging interceptor
+- [ ] application.properties configuration
+- [ ] Actuator endpoints exposed
+
+---
+
+## 🔄 HIGH AVAILABILITY STRATEGY
+
+### Challenge: Multiple Instances Running Concurrently
+
+**Problems to Solve:**
+1. **Duplicate Billing Events**: Two instances might send the same billing event
+2. **Duplicate Capping Actions**: Two instances might disable the same distribution
+3. **Data Consistency**: Race conditions when updating distribution status
+
+### Solutions Implemented:
+
+#### 1. ShedLock (Distributed Locking)
+- **Mechanism**: Database-based pessimistic locking
+- **Table**: `shedlock` with columns: `name`, `lock_until`, `locked_at`, `locked_by`
+- **Behavior**: Only one instance can acquire lock and execute scheduled job
+- **Configuration**:
+  - `lockAtMostFor`: Maximum lock duration (fail-safe)
+  - `lockAtLeastFor`: Minimum lock duration (prevent rapid re-execution)
+
+**Lock Strategy by Job:**
+| Job | Lock Name | At Most For | At Least For | Rationale |
+|-----|-----------|-------------|--------------|-----------|
+| BillingJob | billingJob | 30 min | 5 min | Long-running, process all customers |
+| CappingJob | usageCappingJob | 5 min | 30 sec | Frequent checks, quick execution |
+| DataCollectionJob | dataCollectionJob | 10 min | 2 min | API calls to AWS, moderate duration |
+
+#### 2. Database Constraints (Idempotency)
+- **Unique Constraint**: `billing_event(customer_id, period_start, period_end)`
+- **Effect**: Database prevents duplicate billing events at DB level
+- **Behavior**: If two instances try to insert same billing event, one will fail with constraint violation
+
+#### 3. Optimistic Locking (Distribution Status)
+- **@Version**: JPA version field on `Distribution` entity
+- **Behavior**: If two instances try to update same distribution, one will fail with `OptimisticLockException`
+- **Handling**: Retry logic or accept failure (distribution already disabled)
+
+### HA Verification Checklist:
+- [ ] ShedLock table created in schema.sql
+- [ ] @EnableSchedulerLock configured
+- [ ] All @Scheduled methods have @SchedulerLock annotation
+- [ ] Unique constraints on BillingEvent
+- [ ] @Version field on Distribution entity
+- [ ] Transaction boundaries properly defined
+
+### Discussion Points for Interview:
+1. **ShedLock failure**: What happens if DB goes down during lock acquisition?
+   - Answer: Scheduled jobs won't run until DB recovers (fail-safe)
+2. **Lock timeout**: What if job takes longer than `lockAtMostFor`?
+   - Answer: Lock is released, another instance might start (use conservative timeout)
+3. **Alternative approaches**:
+   - Quartz Scheduler with JDBC JobStore (heavier, more features)
+   - Redis-based locking (requires Redis infrastructure)
+   - Leader election (Kubernetes, ZooKeeper)
+
+---
+
+## ⚠️ CHALLENGES & MITIGATIONS
+
+### Challenge 1: Sliding Window Calculations
+
+**Problem**: Efficiently calculate usage over sliding 15-minute and 3-hour windows.
+
+**Approach**:
+1. Store usage snapshots every 5 minutes from CloudWatch
+2. Query snapshots within time window using indexed queries
+3. Sum data transfer GB from matching snapshots
+
+**Optimization Considerations**:
+- Index on `(distribution_id, snapshot_time, source)` for fast lookups
+- Consider caching recent snapshots in memory (future enhancement)
+- Pre-aggregate at different granularities (1min, 5min, 15min) for faster queries
+
+**Query Example**:
+```sql
+SELECT SUM(data_transfer_gb) 
+FROM usage_snapshot 
+WHERE distribution_id = 'dist-1' 
+  AND snapshot_time >= NOW() - INTERVAL 15 MINUTE
+  AND source = 'CLOUDWATCH'
+```
+
+---
+
+### Challenge 2: Data Source Selection
+
+**Problem**: Choose between CloudWatch (recent, approximate) and Cost Explorer (delayed, accurate).
+
+**Strategy**:
+```
+IF data_age < 24 hours THEN
+    Use CloudWatch (15-minute delay acceptable)
+ELSE
+    Use Cost Explorer (billing-accurate)
+END IF
+```
+
+**Implementation**: `UsageAggregationService.selectDataSource()`
+
+**Edge Cases**:
+- What if CloudWatch data is missing? → Return empty, log warning
+- What if Cost Explorer data is not yet available? → Use CloudWatch with warning
+- Hybrid approach: Merge both sources with priority to Cost Explorer
+
+---
+
+### Challenge 3: Time Zone Handling
+
+**Problem**: Billing periods, customer time zones, UTC vs local time.
+
+**Solution**:
+- Store all timestamps as `Instant` (UTC)
+- Billing periods aligned to midnight UTC
+- API responses include ISO 8601 timestamps with Z suffix
+- Convert to customer timezone only for display (future enhancement)
+
+---
+
+### Challenge 4: Mock Data Limitations
+
+**Problem**: Provided mocks have hardcoded UUIDs that don't match database seeds.
+
+**Mitigation**:
+1. **Option A**: Update seed data to use UUIDs from mocks
+2. **Option B**: Modify CloudWatchClient/CostExplorerClient constructor to accept custom mock data
+3. **Option C**: Create wrapper services that map between mock IDs and DB IDs
+
+**Recommended**: Option B - Allows flexible testing with custom data
+
+---
+
+### Challenge 5: Testing Scheduled Jobs
+
+**Problem**: Hard to test time-based logic without waiting for scheduled execution.
+
+**Solutions**:
+1. **Extract Business Logic**: Move logic out of @Scheduled methods into separate service methods
+2. **Disable Scheduling in Tests**: Use `@ActiveProfiles("test")` with conditional scheduling
+3. **Manual Trigger**: Create test endpoints that trigger jobs manually (disabled in production)
+4. **Mock Clock**: Inject `Clock` bean and mock it in tests
+
+**Test Configuration**:
+```java
+@TestConfiguration
+public class TestSchedulingConfig {
+    @Bean
+    @Primary
+    public Clock fixedClock() {
+        return Clock.fixed(Instant.parse("2025-10-23T12:00:00Z"), ZoneId.of("UTC"));
+    }
+}
+```
+
+---
+
+## 🧪 TESTING STRATEGY
+
+### Unit Tests
+
+**CloudWatchService:**
+- [ ] Test usage retrieval and storage
+- [ ] Test threshold checking (below, at, above limit)
+- [ ] Test window calculations (15min, 3hr)
+- [ ] Mock CloudWatchClient responses
+
+**CostExplorerService:**
+- [ ] Test billing data retrieval
+- [ ] Test customer usage aggregation
+- [ ] Mock CostExplorerClient responses
+
+**UsageAggregationService:**
+- [ ] Test daily aggregation logic
+- [ ] Test data source selection
+- [ ] Test total usage calculation
+
+**Scheduled Jobs:**
+- [ ] Test business logic separately from @Scheduled
+- [ ] Test billing event creation and idempotency
+- [ ] Test capping logic and threshold detection
+- [ ] Mock all external dependencies
+
+### Integration Tests
+
+**UsageController:**
+- [ ] Test GET /api/usage with valid customer
+- [ ] Test missing X-Customer-Id header → 400
+- [ ] Test invalid customer ID → 404
+- [ ] Test date range validation
+- [ ] Test response format
+
+**Database:**
+- [ ] Test custom queries (findByCustomerAndTimeRange, etc.)
+- [ ] Test unique constraints (duplicate billing events)
+- [ ] Test optimistic locking on Distribution
+
+**End-to-End:**
+- [ ] Full flow: Data collection → Aggregation → API response
+- [ ] Full flow: Usage exceeds limit → Distribution disabled → Event published
+- [ ] Full flow: Billing job execution → Event sent → DB updated
+
+### Test Data Setup
+
+```java
+@TestConfiguration
+public class TestDataConfig {
+    
+    @Bean
+    public CloudWatchClient testCloudWatchClient() {
+        return new CloudWatchClient(List.of(
+            new RecordedMetricUsage("dist-1", 60.0),
+            new RecordedMetricUsage("dist-2", 120.0),
+            new RecordedMetricUsage("dist-3", 30.0)
+        ));
+    }
+    
+    @Bean
+    public CostExplorerClient testCostExplorerClient() {
+        return new CostExplorerClient(List.of(
+            new RecordedBillingUsage("dist-1", 100.0, 500.5),
+            new RecordedBillingUsage("dist-2", 50.0, 250.3),
+            new RecordedBillingUsage("dist-3", 75.0, 800.7)
+        ));
+    }
+}
+```
+
+---
+
+## 📊 OBSERVABILITY PLAN
+
+### Logging Strategy
+
+**Log Levels:**
+
+**INFO:**
+- Scheduled job start/completion with summary
+- Billing events sent (customer, amount)
+- CDN disablement (distribution, reason)
+- API requests (method, endpoint, customer)
+
+**DEBUG:**
+- Detailed usage calculations
+- Data source selection decisions
+- Individual snapshot storage
+- Query execution details
+
+**WARN:**
+- Usage approaching limits (80%, 90%)
+- Missing data from AWS sources
+- Stale data detection
+- Failed idempotency checks (already processed)
+
+**ERROR:**
+- AWS client failures with stack traces
+- Database errors
+- Unexpected exceptions in jobs
+- Data inconsistencies
+
+### Metrics to Expose
+
+**Business Metrics:**
+```
+cdn.billing.events.sent{customer}          - Counter
+cdn.billing.latest.usage.gb{customer}      - Gauge
+cdn.capping.events{reason,distribution}    - Counter
+cdn.distributions.active                    - Gauge
+cdn.distributions.disabled                  - Gauge
+cdn.api.requests{customer,endpoint}        - Counter
+```
+
+**Technical Metrics:**
+```
+cdn.billing.job.executions                 - Counter
+cdn.billing.job.duration                   - Timer
+cdn.billing.job.errors                     - Counter
+cdn.data.collection.snapshots{source}      - Counter
+cdn.api.response.time                      - Timer
+```
+
+**JVM Metrics (via Actuator):**
+- Memory usage
+- Thread count
+- GC statistics
+
+### Health Checks
+
+**Endpoints:**
+- `/actuator/health` - Overall health
+- `/actuator/health/db` - Database connectivity
+- `/actuator/health/awsDataSource` - Custom AWS health check
+- `/actuator/metrics` - All metrics
+- `/actuator/scheduledtasks` - View scheduled jobs
+
+**Custom Health Check:**
+```java
+@Component
+public class AwsDataSourceHealthIndicator implements HealthIndicator {
+    @Override
+    public Health health() {
+        // Test CloudWatch and Cost Explorer connectivity
+    }
+}
+```
+
+---
+
+## ✅ IMPLEMENTATION CHECKLIST
+
+### Phase 1: Domain Model & Database ✓
+- [ ] Create Customer entity
+- [ ] Create Distribution entity with @Version
+- [ ] Create UsageSnapshot entity with indexes
+- [ ] Create BillingEvent entity with unique constraint
+- [ ] Create all repositories with custom queries
+- [ ] Create schema.sql with all tables and indexes
+- [ ] Create data.sql with seed data
+- [ ] Create enums: DistributionStatus, UsageDataSource, BillingEventStatus
+
+### Phase 2: AWS Data Retrieval ✓
+- [ ] Implement CloudWatchService
+- [ ] Implement CostExplorerService
+- [ ] Implement UsageAggregationService
+- [ ] Create DTOs: DailyUsageDTO
+- [ ] Add error handling for AWS failures
+- [ ] Write unit tests for all services
+
+### Phase 3: Scheduled Jobs ✓
+- [ ] Add ShedLock dependencies to pom.xml
+- [ ] Create SchedulingConfig with @EnableSchedulerLock
+- [ ] Implement BillingScheduledJob with @SchedulerLock
+- [ ] Implement UsageCappingScheduledJob with @SchedulerLock
+- [ ] Implement DataCollectionScheduledJob with @SchedulerLock
+- [ ] Add proper transaction boundaries
+- [ ] Add comprehensive logging
+- [ ] Test idempotency scenarios
+
+### Phase 4: REST API ✓
+- [ ] Implement UsageController
+- [ ] Create UsageResponse DTO
+- [ ] Implement GlobalExceptionHandler
+- [ ] Create custom exceptions (CustomerNotFoundException, etc.)
+- [ ] Add request validation
+- [ ] Add RequestLoggingInterceptor
+- [ ] Write integration tests
+
+### Phase 5: Integration Layer ✓
+- [ ] Implement BillingEventPublisher
+- [ ] Implement CdnDisableService
+- [ ] Format events according to specification
+- [ ] Add production-ready comments for Kafka
+
+### Phase 6: Observability ✓
+- [ ] Implement UsageMetricsService
+- [ ] Implement AwsDataSourceHealthIndicator
+- [ ] Configure application.properties
+- [ ] Configure actuator endpoints
+- [ ] Add structured logging
+
+### Final Verification ✓
+- [ ] Run application and verify startup
+- [ ] Test H2 console connectivity
+- [ ] Test REST API with curl/Postman
+- [ ] Verify scheduled jobs execute
+- [ ] Check actuator endpoints
+- [ ] Review logs for errors
+- [ ] Verify metrics are exposed
+
+---
+
+## 🚀 IMPLEMENTATION ORDER
+
+**Recommended Sequence:**
+
+1. **Database Foundation** (30 min)
+   - Entities → Repositories → Schema → Seeds
+   
+2. **AWS Integration** (45 min)
+   - CloudWatchService → CostExplorerService → Aggregation
+   
+3. **Scheduled Jobs** (60 min)
+   - ShedLock setup → DataCollectionJob → CappingJob → BillingJob
+   
+4. **REST API** (30 min)
+   - Controller → DTOs → Exception Handling
+   
+5. **Integration** (20 min)
+   - Publishers → Event Formatting
+   
+6. **Observability** (20 min)
+   - Metrics → Health → Logging → Configuration
+   
+7. **Testing & Polish** (15 min)
+   - Manual testing → Fix bugs → Documentation
+
+**Total: 3h 40min** (20min buffer)
+
+---
+
+## 📚 KEY DISCUSSION POINTS FOR INTERVIEW
+
+### Architecture Decisions:
+1. **Why ShedLock over Quartz?**
+   - Simpler setup, sufficient for use case
+   - No additional infrastructure required
+   - Database-based locking fits existing stack
+
+2. **Why H2 over PostgreSQL?**
+   - Challenge requirement for quick setup
+   - Production would use PostgreSQL/MySQL
+
+3. **Data Source Selection Strategy**
+   - CloudWatch for recent data (< 24h, 15min delay)
+   - Cost Explorer for billing (> 24h, accurate)
+   - Hybrid approach possible for better accuracy
+
+### Scalability Considerations:
+1. **Database becomes bottleneck?**
+   - Add read replicas for API queries
+   - Separate billing DB from operational DB
+   - Cache recent usage data in Redis
+
+2. **High cardinality metrics?**
+   - Limit customer tag values
+   - Aggregate metrics at different levels
+   - Use sampling for high-volume metrics
+
+3. **Scheduled job optimization?**
+   - Parallel processing per customer
+   - Batch operations in groups
+   - Partition work across multiple jobs
+
+### Production Enhancements:
+1. **Message Broker Integration**
+   - Replace System.out with Kafka producer
+   - Add retry logic and dead letter queues
+   - Implement event schemas with Avro
+
+2. **Monitoring & Alerting**
+   - Grafana dashboards for metrics
+   - PagerDuty alerts for capping events
+   - CloudWatch alarms for job failures
+
+3. **Security**
+   - OAuth2 authentication for API
+   - Rate limiting per customer
+   - Audit logging for all actions
+
+---
+
+## 🎯 SUCCESS CRITERIA
+
+**Functional Requirements Met:**
+- ✅ Billing events sent every 24 hours
+- ✅ REST API exposes usage with 15-minute delay
+- ✅ CDN disabled when limits exceeded
+- ✅ Dual data sources properly utilized
+
+**Non-Functional Requirements Met:**
+- ✅ HA mode supported with ShedLock
+- ✅ Idempotency guaranteed
+- ✅ Comprehensive logging implemented
+- ✅ Metrics exposed via Actuator
+
+**Code Quality:**
+- ✅ Clean architecture (layers, separation of concerns)
+- ✅ Proper error handling
+- ✅ Transaction management
+- ✅ Unit and integration tests
+
+**Interview Performance:**
+- ✅ Clear explanation of design decisions
+- ✅ Discussion of trade-offs
+- ✅ Awareness of production considerations
+- ✅ Problem-solving approach demonstrated
+
+---
+
+**STATUS**: ✅ PLAN COMPLETE - READY FOR IMPLEMENTATION
+
+**NEXT MODE**: IMPLEMENT MODE
+
+**ESTIMATED COMPLETION**: 4 hours
